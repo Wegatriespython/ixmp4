@@ -83,6 +83,25 @@ class TestRunTransact:
         thread.join()
         sync_lock.release()
 
+    def test_stale_holder_cannot_release_new_lock(
+        self, platform: ixmp4.Platform
+    ) -> None:
+        _ = platform.runs.create("Model", "Scenario")
+        run1 = platform.runs.get("Model", "Scenario", version=1)
+        run2 = platform.runs.get("Model", "Scenario", version=1)
+
+        run1._lock()
+        platform.backend.runs.unlock(run1.id)
+        run2._lock()
+        run1.set_as_default()  # refreshes run1 with run2's lock
+
+        with pytest.raises(ixmp4.Run.IsLocked):
+            run1._unlock()
+        with pytest.raises(ixmp4.Run.LockRequired):
+            run1._unlock()
+        with pytest.raises(ixmp4.Run.IsLocked):
+            run1._lock()
+
     def test_transact_nested_raises(self, platform: ixmp4.Platform) -> None:
         run = platform.runs.create("Model", "Scenario")
 

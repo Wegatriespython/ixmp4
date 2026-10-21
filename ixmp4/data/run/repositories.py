@@ -85,6 +85,31 @@ class ItemRepository(RunAuthRepository, BaseItemRepository[Run]):
             with self.executor.insert_one(exc) as result:
                 return cast(int, result.scalar_one())
 
+    def acquire_lock(self, id: int, lock_transaction: int, lock_token: str) -> bool:
+        # check and write in a single statement, so that of concurrent callers
+        # exactly one matches; `update_by_pk` would raise `NotFound` for the others
+        exc = (
+            self.target.update_statement()
+            .where(Run.id == id)
+            .where(Run.lock_transaction.is_(None))
+            .values(lock_transaction=lock_transaction, lock_token=lock_token)
+        )
+        with self.wrap_executor_exception():
+            with self.executor.update(exc) as rowcount:
+                return rowcount == 1
+
+    def release_lock(self, id: int, lock_token: str | None = None) -> bool:
+        exc = (
+            self.target.update_statement()
+            .where(Run.id == id)
+            .values(lock_transaction=None, lock_token=None)
+        )
+        if lock_token is not None:
+            exc = exc.where(Run.lock_token == lock_token)
+        with self.wrap_executor_exception():
+            with self.executor.update(exc) as rowcount:
+                return rowcount == 1
+
     def delete_cascade(self, id: int) -> None:
         """Delete a run and all associated iamc, optimization and meta data.
 

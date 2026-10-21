@@ -153,6 +153,7 @@ class Run(BaseFacadeObject[RunService, RunDto]):
     maximum_lock_timeout: float = 5
 
     _cloner: RunCloner = RunCloner()
+    _lock_token: str | None = None
 
     def __init__(self, backend: Backend, dto: RunDto) -> None:
         super().__init__(backend, dto)
@@ -223,12 +224,18 @@ class Run(BaseFacadeObject[RunService, RunDto]):
 
     def _lock(self) -> None:
         self._dto = self._service.lock(self._dto.id)
+        # kept apart from the DTO, which a refresh replaces
+        self._lock_token = self._dto.lock_token
         self.owns_lock = True
         logger.debug(f"Acquired lock on {self}.")
 
     def _unlock(self) -> None:
-        self._dto = self._service.unlock(self._dto.id)
-        self.owns_lock = False
+        self.require_lock()
+        try:
+            self._dto = self._service.unlock(self._dto.id, lock_token=self._lock_token)
+        finally:
+            self._lock_token = None
+            self.owns_lock = False
         logger.debug(f"Released lock on {self}.")
 
     def _lock_with_timeout(self, timeout: float) -> None:

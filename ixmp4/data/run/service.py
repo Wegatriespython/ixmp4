@@ -1,3 +1,4 @@
+import uuid
 from contextlib import suppress
 from typing import List
 
@@ -528,6 +529,9 @@ class RunService(GetByIdService):
     def lock(self, id: int) -> Run:
         """Locks a run at the current transaction (via `transaction__id`).
 
+        The returned run carries a `lock_token` that is unique to this
+        acquisition. Pass it to :meth:`unlock` to release the lock.
+
         Parameters
         ----------
         id : int
@@ -541,14 +545,15 @@ class RunService(GetByIdService):
             If the run is already locked.
 
         """
-        run = self.items.get_by_pk({"id": id})
-
-        if run.lock_transaction is not None:
-            raise RunIsLocked()
+        run = Run.model_validate(self.items.get_by_pk({"id": id}))
 
         latest_transaction = self.transactions.latest()
-        self.items.update_by_pk({"id": id, "lock_transaction": latest_transaction.id})
-        return Run.model_validate(self.items.get_by_pk({"id": id}))
+        lock_token = uuid.uuid4().hex
+        if not self.items.acquire_lock(id, latest_transaction.id, lock_token):
+            raise RunIsLocked()
+        return run.model_copy(
+            update={"lock_transaction": latest_transaction.id, "lock_token": lock_token}
+        )
 
     @lock.auth_check()
     def lock_auth_check(
@@ -560,25 +565,38 @@ class RunService(GetByIdService):
         )
 
     @procedure(Http(path="/{id:int}/unlock", methods=("POST",)))
-    def unlock(self, id: int) -> Run:
-        """Locks a run at the current transaction (via `transaction__id`).
+    def unlock(self, id: int, lock_token: str | None = None) -> Run:
+        """Unlocks a run.
 
         Parameters
         ----------
         id : int
             Unique integer id.
+        lock_token : str, optional
+            The `lock_token` returned by :meth:`lock`. If given, the run is only
+            unlocked if this token holds the lock; if omitted, the lock is
+            released unconditionally (to recover a lock whose holder is gone).
 
         Raises
         ------
         :class:`RunNotFound`:
             If no run with the `id` exists.
+        :class:`RunIsLocked`:
+            If `lock_token` is given and the run is locked by someone else.
         """
-        self.items.update_by_pk({"id": id, "lock_transaction": None})
-        return Run.model_validate(self.items.get_by_pk({"id": id}))
+        released = self.items.release_lock(id, lock_token)
+        run = self.items.get_by_pk({"id": id})
+        if not released and run.lock_transaction is not None:
+            raise RunIsLocked(message="This run is locked by another holder.")
+        return Run.model_validate(run)
 
     @unlock.auth_check()
     def unlock_auth_check(
-        self, auth_ctx: AuthorizationContext, platform: PlatformProtocol, id: int
+        self,
+        auth_ctx: AuthorizationContext,
+        platform: PlatformProtocol,
+        id: int,
+        lock_token: str | None = None,
     ) -> None:
         run = self.items.get_by_pk({"id": id})
         auth_ctx.has_edit_permission(

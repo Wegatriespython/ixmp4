@@ -42,6 +42,7 @@ class Run(BaseModel, HasUpdateInfo):
     version: Integer = orm.mapped_column(sa.Integer, nullable=False)
     is_default: Boolean = orm.mapped_column(sa.Boolean, default=False, nullable=False)
     lock_transaction: Mapped[int | None] = orm.mapped_column(nullable=True, index=True)
+    lock_token: Mapped[str | None] = orm.mapped_column(sa.String(32), nullable=True)
 
 
 class RunVersion(versions.BaseVersionModel):
@@ -51,6 +52,7 @@ class RunVersion(versions.BaseVersionModel):
     version: Integer = orm.mapped_column(nullable=False)
     is_default: Boolean = orm.mapped_column(nullable=False)
     lock_transaction: Integer = orm.mapped_column(nullable=True, index=True)
+    lock_token: String = orm.mapped_column(sa.String(32), nullable=True)
 
     created_at: DateTime = orm.mapped_column(nullable=True)
     created_by: String = orm.mapped_column(sa.String(255), nullable=True)

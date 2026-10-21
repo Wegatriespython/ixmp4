@@ -22,6 +22,8 @@ class Run(BaseModel, HasCreationInfo, HasUpdateInfo):
     "`True` if this is the default run version."
 
     lock_transaction: int | None
+    lock_token: str | None = None
+    "Identifies the holder of the lock; unique per acquisition."
 
     def __str__(self) -> str:
         return f"<Run model='{self.model.name}' \

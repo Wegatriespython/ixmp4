@@ -22,6 +22,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 import ixmp4
 from ixmp4.transport import DirectTransport
 from tests import backends
+from tests.base import TransportTest
 from tests.fixtures import get_migration_data
 
 
@@ -97,3 +98,11 @@ def test_upgrade(alembic: MigrationContext, transport: DirectTransport) -> None:
     iamc_data = mp.iamc.tabulate(run={"default_only": False})
     assert len(iamc_data) == 9436
     assert not iamc_data["value"].isnull().any()
+
+    # the lock token added after these data reaches the run and its versions
+    run_id = mp.backend.runs.list(default_only=False)[0].id
+    lock_token = mp.backend.runs.lock(run_id).lock_token
+    assert mp.backend.runs.get_by_id(run_id).lock_token == lock_token
+    if TransportTest.transport_is_pgsql(transport):
+        versions = mp.backend.runs.versions.tabulate()
+        assert lock_token in versions["lock_token"].values

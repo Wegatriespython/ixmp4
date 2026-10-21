@@ -1,12 +1,17 @@
 import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pandas as pd
 import pandas.testing as pdt
 import pytest
+import sqlalchemy as sa
 
 from ixmp4.base_exceptions import Forbidden
-from ixmp4.data.run.exceptions import NoDefaultRunVersion, RunNotFound
+from ixmp4.data.run.exceptions import NoDefaultRunVersion, RunIsLocked, RunNotFound
 from ixmp4.data.run.service import RunService
+from ixmp4.transport import DirectTransport, Session, Transport
 from tests import auth, backends
 from tests.data.base import ServiceTest
 
@@ -43,6 +48,7 @@ class TestRunCreate(RunServiceTest):
                     pd.NaT,
                     None,
                     None,
+                    None,
                     3,
                     None,
                     0,
@@ -59,6 +65,7 @@ class TestRunCreate(RunServiceTest):
                 "updated_at",
                 "updated_by",
                 "lock_transaction",
+                "lock_token",
                 "transaction_id",
                 "end_transaction_id",
                 "operation_type",
@@ -93,6 +100,7 @@ class TestRunCreate(RunServiceTest):
                     pd.NaT,
                     None,
                     None,
+                    None,
                     3,
                     None,
                     0,
@@ -106,6 +114,7 @@ class TestRunCreate(RunServiceTest):
                     fake_time.replace(tzinfo=None),
                     "@unknown",
                     pd.NaT,
+                    None,
                     None,
                     None,
                     4,
@@ -124,6 +133,7 @@ class TestRunCreate(RunServiceTest):
                 "updated_at",
                 "updated_by",
                 "lock_transaction",
+                "lock_token",
                 "transaction_id",
                 "end_transaction_id",
                 "operation_type",
@@ -155,10 +165,10 @@ class TestRunGetRunVersions(RunServiceTest):
     ) -> None:
         expected_versions = pd.DataFrame(
             [
-                [1, 1, 1, 1, False, None, 3, None, 0],
-                [2, 1, 1, 2, False, None, 4, 6, 0],
-                [2, 1, 1, 2, True, None, 6, None, 1],
-                [3, 1, 1, 3, False, None, 7, None, 0],
+                [1, 1, 1, 1, False, None, None, 3, None, 0],
+                [2, 1, 1, 2, False, None, None, 4, 6, 0],
+                [2, 1, 1, 2, True, None, None, 6, None, 1],
+                [3, 1, 1, 3, False, None, None, 7, None, 0],
             ],
             columns=[
                 "id",
@@ -167,6 +177,7 @@ class TestRunGetRunVersions(RunServiceTest):
                 "version",
                 "is_default",
                 "lock_transaction",
+                "lock_token",
                 "transaction_id",
                 "end_transaction_id",
                 "operation_type",
@@ -221,6 +232,10 @@ class TestRunNotFound(RunServiceTest):
     ) -> None:
         with pytest.raises(RunNotFound):
             service.get_by_id(1)
+        with pytest.raises(RunNotFound):
+            service.lock(1)
+        with pytest.raises(RunNotFound):
+            service.unlock(1)
 
 
 class TestRunList(RunServiceTest):
@@ -336,6 +351,99 @@ class TestRunTabulate(RunServiceTest):
             default_only=False,
         ).drop(columns=["model__id", "scenario__id"])
         pdt.assert_frame_equal(expected_runs, runs, check_like=True)
+
+
+class TestRunLock(RunServiceTest):
+    def test_run_lock(self, service: RunService) -> None:
+        run = service.create("Model", "Scenario")
+        locked = service.lock(run.id)
+        assert locked.lock_transaction is not None
+
+        with pytest.raises(RunIsLocked):
+            service.lock(run.id)
+        assert service.get_by_id(run.id).lock_token == locked.lock_token
+
+    @pytest.mark.parametrize("with_token", [True, False])
+    def test_run_unlock(self, service: RunService, with_token: bool) -> None:
+        run = service.create("Model", "Scenario")
+        locked = service.lock(run.id)
+        lock_token = locked.lock_token if with_token else None
+
+        unlocked = service.unlock(run.id, lock_token=lock_token)
+        assert unlocked.lock_transaction is None
+        assert unlocked.lock_token is None
+        # unlocking an unlocked run is a no-op
+        assert service.unlock(run.id, lock_token=lock_token).lock_transaction is None
+
+    def test_run_unlock_stale_token(self, service: RunService) -> None:
+        run = service.create("Model", "Scenario")
+        stale = service.lock(run.id).lock_token
+        service.unlock(run.id, lock_token=stale)
+        current = service.lock(run.id).lock_token
+
+        # a late or repeated unlock by the previous holder
+        with pytest.raises(RunIsLocked):
+            service.unlock(run.id, lock_token=stale)
+        assert service.get_by_id(run.id).lock_token == current
+
+    def test_run_lock_concurrent(self, transport: Transport, tmp_path: Path) -> None:
+        """Of several callers on their own connections, exactly one acquires
+        the lock in each round."""
+        if not isinstance(transport, DirectTransport):
+            self.skip_transport(transport, "cannot open further connections")
+        engine = racing_engine(transport, tmp_path)
+        transports = [
+            DirectTransport(Session(bind=engine), check_alembic_version=False)
+            for _ in range(6)
+        ]
+        services = [RunService(t) for t in transports]
+        try:
+            run = services[0].create("Model", "Scenario")
+            # on SQLite the first lock creates the only transaction row, which
+            # must not itself be raced
+            services[0].unlock(services[0].lock(run.id).id)
+            holders = []
+            for _ in range(10):
+                holders.append(race_for_lock(services, run.id))
+                services[0].unlock(run.id)
+        finally:
+            for t in transports:
+                t.close()
+
+        assert holders == [1] * 10
+
+
+def racing_engine(transport: DirectTransport, tmp_path: Path) -> sa.Engine:
+    """An engine for the transport's database that gives each session its own
+    connection, unlike the transport's own engine."""
+    assert transport.session.bind is not None
+    url = transport.session.bind.engine.url
+    if url.get_backend_name() != "sqlite":
+        return sa.create_engine(url, max_identifier_length=63)
+
+    # an in-memory SQLite database is private to its connection
+    engine = sa.create_engine(
+        f"sqlite:///{tmp_path / 'race.sqlite3'}",
+        connect_args={"check_same_thread": False},
+    )
+    backends.create_model_tables(engine)
+    return engine
+
+
+def race_for_lock(services: list[RunService], run_id: int) -> int:
+    """Let all services call `lock` at once and return how many acquired it."""
+    start = threading.Barrier(len(services), timeout=60)
+
+    def racer(service: RunService) -> bool:
+        start.wait()
+        try:
+            service.lock(run_id)
+        except RunIsLocked:
+            return False
+        return True
+
+    with ThreadPoolExecutor(len(services)) as pool:
+        return sum(pool.map(racer, services))
 
 
 class TestRunAuthSarahPrivate(auth.SarahTest, auth.PrivatePlatformTest, RunServiceTest):

@@ -20,10 +20,14 @@ the :meth:`~ixmp4.core.run.Run.transact` context manager may be used.
     :no-index:
     
 Internally, ixmp4 will save the last transaction id in the database as
-the ``lock_transaction`` column for the run's row.
-Any subsequent attempt to lock the run will result in an exception as 
-the column will be read and only updated if it currently contains ``NULL`` / ``None``.
-No additional checks for lock ownership are implemented in the data layer.
+the ``lock_transaction`` column for the run's row, together with a random
+``lock_token`` that is unique to this acquisition.
+The lock is acquired with a single conditional update that only succeeds if
+``lock_transaction`` currently contains ``NULL`` / ``None``, so of any number of
+concurrent attempts exactly one succeeds and the others result in an exception.
+When a ``lock_token`` is given, the lock is only released if it matches the
+holder's; without one, the lock is released unconditionally.
+Writes to the run are not checked against the lock in the data layer.
 
 Any well-behaved ixmp4 client must remember that it has acquired this 
 run's lock, for example with the :attr:`~ixmp4.core.run.Run.owns_lock` property.
